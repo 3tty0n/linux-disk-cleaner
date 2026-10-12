@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""GUI to find and delete disposable files (caches, trash, old packages, big files).
+
+disk-cleaner          GUI
+disk-cleaner --list   print candidates, no GUI (smoke test)
+"""
+import glob, os, shlex, shutil, subprocess, sys, threading
+
+HOME = os.path.expanduser("~")
+BIG = "500M"  # large-file search threshold (find -size syntax)
+
+
+def du(path):
+    r = subprocess.run(["du", "-sxb", path], capture_output=True, text=True)
+    return int(r.stdout.split()[0]) if r.stdout else 0
+
+
+def human(n):
+    for u in "BKMGT":
+        if n < 1024 or u == "T":
+            return f"{n:.1f} {u}" if u != "B" else f"{n} B"
+        n /= 1024
+
+
+def scan():
+    """Yield (label, target, size, kind). kind: rm=delete path, clear=empty dir, cmd=run as root."""
+    p = lambda *a: os.path.join(HOME, *a)
+    if os.path.isdir(p(".cache")):
+        for e in sorted(os.scandir(p(".cache")), key=lambda e: e.name):
+            if e.name == "paru":  # keep clones (PKGBUILDs/diff history), drop only build dirs
+                continue
+            yield f"cache: {e.name}", e.path, du(e.path), "rm"
+    for label, path in [
+        ("trash", p(".local/share/Trash")),
+        ("npm cache", p(".npm/_cacache")),
+        ("cargo registry cache", p(".cargo/registry/cache")),
+    ]:
+        if os.path.exists(path):
+            yield label, path, du(path), "clear" if label == "trash" else "rm"
+    build = glob.glob(p(".cache/paru/clone/*/src")) + glob.glob(p(".cache/paru/clone/*/pkg"))
+    if build:
+        yield "paru build dirs (src/pkg)", "\n".join(build), sum(map(du, build)), "rm"
+    yield "pacman cache (uninstalled pkgs/old versions)", "pacman -Sc --noconfirm", du("/var/cache/pacman/pkg"), "cmd"
+    yield "systemd journal (keep 200M)", "journalctl --vacuum-size=200M", du("/var/log/journal"), "cmd"
+    r = subprocess.run(
+        ["find", HOME, "-xdev", "-type", "f", "-size", f"+{BIG}",
+         "-not", "-path", p(".cache/*"), "-not", "-path", p(".local/share/Trash/*"),
+         "-printf", "%s\t%p\n"], capture_output=True, text=True)
+    for line in r.stdout.splitlines():
+        s, f = line.split("\t", 1)
+        yield f"big file: {os.path.relpath(f, HOME)}", f, int(s), "rm"
+
+
+def delete(target, kind):
+    if kind == "cmd":
+        subprocess.run(["pkexec", *shlex.split(target)], check=True)
+    elif kind == "clear":
+        for e in os.scandir(target):
+            delete(e.path, "rm")
+    elif "\n" in target:  # several paths
+        for t in target.split("\n"):
+            delete(t, "rm")
+    elif os.path.isdir(target) and not os.path.islink(target):
+        subprocess.run(["chmod", "-R", "u+w", target])  # makepkg/go leave read-only dirs
+        shutil.rmtree(target)
+    else:
+        os.unlink(target)
+
+
+def gui():
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import GLib, GObject, Gtk
+
+    store = Gtk.ListStore(bool, str, GObject.TYPE_INT64, str, str)  # sel, label, size, target, kind
+    status = Gtk.Label(xalign=0)
+    win = Gtk.Window(title="Disk Cleaner", default_width=900, default_height=600)
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=8)
+    win.add(box)
+
+    def refresh_status(msg=""):
+        u = shutil.disk_usage("/")
+        sel = sum(r[2] for r in store if r[0])
+        status.set_text(f"/ free {human(u.free)} of {human(u.total)}  |  selected {human(sel)}  {msg}")
+
+    def on_toggle(_, path):
+        store[path][0] = not store[path][0]
+        refresh_status()
+
+    tree = Gtk.TreeView(model=store)
+    tog = Gtk.CellRendererToggle()
+    tog.connect("toggled", on_toggle)
+    tree.append_column(Gtk.TreeViewColumn("", tog, active=0))
+    tree.append_column(Gtk.TreeViewColumn("Item", Gtk.CellRendererText(), text=1))
+    size_col = Gtk.TreeViewColumn("Size", Gtk.CellRendererText(xalign=1), text=2)
+    size_col.set_cell_data_func(size_col.get_cells()[0], lambda c, r, m, i, _: r.set_property("text", human(m[i][2])))
+    size_col.set_sort_column_id(2)
+    tree.append_column(size_col)
+    tree.get_column(1).set_expand(True)
+    tree.get_column(1).set_sort_column_id(1)
+    store.set_sort_column_id(2, Gtk.SortType.DESCENDING)
+    sw = Gtk.ScrolledWindow(vexpand=True)
+    sw.add(tree)
+
+    scan_btn, del_btn = Gtk.Button(label="Rescan"), Gtk.Button(label="Delete selected")
+    bar = Gtk.Box(spacing=6)
+    bar.pack_start(status, True, True, 0)
+    bar.pack_end(del_btn, False, False, 0)
+    bar.pack_end(scan_btn, False, False, 0)
+    box.pack_start(sw, True, True, 0)
+    box.pack_start(bar, False, False, 0)
+
+    def add(label, target, size, kind):
+        if size > 0:
+            store.append([False, label, size, target, kind])
+        refresh_status("(scanning...)")
+
+    def do_scan(_=None):
+        store.clear()
+        scan_btn.set_sensitive(False)
+
+        def work():
+            for row in scan():
+                GLib.idle_add(add, *row)
+            GLib.idle_add(lambda: (scan_btn.set_sensitive(True), refresh_status("done")))
+        threading.Thread(target=work, daemon=True).start()
+
+    def do_delete(_):
+        rows = [r for r in store if r[0]]
+        if not rows:
+            return
+        d = Gtk.MessageDialog(transient_for=win, message_type=Gtk.MessageType.WARNING,
+                              buttons=Gtk.ButtonsType.OK_CANCEL,
+                              text=f"Permanently delete {len(rows)} items ({human(sum(r[2] for r in rows))})?")
+        d.format_secondary_text("\n".join(r[1] for r in rows))
+        ok = d.run() == Gtk.ResponseType.OK
+        d.destroy()
+        if not ok:
+            return
+        jobs = [(r[1], r[3], r[4]) for r in rows]
+        del_btn.set_sensitive(False)
+
+        def work():
+            errs = []
+            for label, target, kind in jobs:
+                GLib.idle_add(refresh_status, f"deleting {label}...")
+                try:
+                    delete(target, kind)
+                except Exception as e:
+                    errs.append(f"{label}: {e}")
+            GLib.idle_add(finish, errs)
+
+        def finish(errs):
+            del_btn.set_sensitive(True)
+            if errs:
+                m = Gtk.MessageDialog(transient_for=win, message_type=Gtk.MessageType.ERROR,
+                                      buttons=Gtk.ButtonsType.CLOSE, text="Some deletions failed")
+                m.format_secondary_text("\n".join(errs))
+                m.run(); m.destroy()
+            do_scan()
+        threading.Thread(target=work, daemon=True).start()
+
+    scan_btn.connect("clicked", do_scan)
+    del_btn.connect("clicked", do_delete)
+    win.connect("destroy", Gtk.main_quit)
+    win.show_all()
+    do_scan()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    if "--list" in sys.argv:
+        for label, target, size, kind in sorted(scan(), key=lambda r: -r[2]):
+            print(f"{human(size):>9}  {kind:5} {label}")
+    else:
+        gui()

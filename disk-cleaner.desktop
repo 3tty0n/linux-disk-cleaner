@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Disk Cleaner
+Comment=Find and delete disposable files
+Exec=disk-cleaner
+Icon=drive-harddisk
+Categories=System;Utility;

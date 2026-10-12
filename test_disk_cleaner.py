@@ -33,6 +33,12 @@ for bad in ["sudo rm -rf /", "sudo pacman -Sc --noconfirm", "sudo pacman -Rns fo
             "sudo pacman -Rns -dd x", "sudo pacman -Rns $(rm -rf ~)", "sudo apt-get remove x y", "rm -rf /"]:
     assert refused(bad, "cmd"), bad
 
+# --- critical / own packages can never be removed, even via an allow-listed command
+dc.PM = dict(owner=lambda f: "", critical=lambda p: p == "glibc")
+dc.self_packages.cache_clear()
+assert refused("sudo pacman -Rns glibc", "cmd") and refused("sudo apt-get remove glibc", "cmd")
+assert not refused("sudo pacman -Rns libfoo", "cmd")
+
 # --- explaining failures
 i = dc.issue("pacman package cache", "error: failed to init transaction (unable to lock database)")
 assert "Another package manager" in i.cause, i

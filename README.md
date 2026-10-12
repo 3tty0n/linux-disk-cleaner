@@ -1,36 +1,80 @@
 # disk-cleaner
 
-Desktop app (GTK3 + PyGObject + cairo) to find and delete disposable files on Linux: Arch (pacman, paru/yay),
-Debian/Ubuntu (apt) and Fedora (dnf). A donut chart shows what takes the space (top 7 + "Other"; click a slice or a
-row to select, selected slices pop out), next to a sortable list and a `/` usage bar. Nothing is pre-selected.
+- [Overview](#overview)
+- [Prerequisites](#prerequisites)
+- [Setup](#setup)
+- [Install](#install)
+- [License](#license)
 
-| Candidate | How it is removed |
-|---|---|
-| `$XDG_CACHE_HOME/*` (`~/.cache`), npm/cargo caches, trash (`files/`+`info/`) | contents emptied, directory kept |
-| paru clones: untracked files only (`src/`, `pkg/`, sources, built packages) | deleted; PKGBUILD + `.git` kept |
-| files over 500MB in `$HOME` | deleted (permanent) after a confirmation dialog, with a ⚠ note |
-| package cache, unneeded packages, packages owning a big file, systemd journal | **never unlinked directly**: run in a terminal as `sudo pacman -Sc` / `paru -Rns …` / `sudo apt-get autoremove --purge` / `sudo dnf remove …` / `sudo journalctl --vacuum-size=…`, so the package manager/sudo ask for confirmation |
+## Overview
 
-## Safety
-- Only an allow-list of commands can run (`ALLOWED_CMD`); no `--noconfirm`, no `-dd`, no free-form shell.
-- Direct deletion is limited to paths inside `$HOME`; `$HOME` itself, `~/.ssh`, `~/.gnupg`, `~/.config`, `~/.local`,
-  `~/Documents` and friends, the cache/data roots and mount points are refused (symlinks are resolved first).
-- Big files owned by a package, critical packages (base/essential/kernel), and the packages this program runs on are
-  never offered; files under `~/.ssh`, `~/.gnupg`, `~/.config`, `~/.local` are not offered either.
-- The confirmation dialog lists what is deleted now vs. run in a terminal, plus ⚠ warnings; Cancel is the default.
+GTK3 desktop app that finds disposable files and deletes them.
 
-## Problems
-Nothing is printed on the CLI. Failed deletions/commands and unreadable paths are analysed and shown in the GUI
-(what happened / likely cause / what to do), e.g. root-owned files, unwritable parent dirs, stale pacman locks, sudo failures.
-The "⚠ Problems (N)" button re-opens them.
+- Donut chart, sortable list and `/` usage bar; nothing is pre-selected
+- Arch (pacman, paru/yay) is tested; apt and dnf are not run on real machines
+- Failures are explained in the GUI; nothing is printed on the CLI
+
+### What it finds
+
+- `~/.cache/*`, npm/cargo caches, trash: contents emptied, dir kept
+- paru clones: untracked files only (`PKGBUILD` and `.git` kept)
+- Files over 500 MB in `$HOME`: deleted permanently, with a warning
+- Package cache, unneeded packages, journal: run via the package manager
+
+Package-manager items open a terminal and run `sudo pacman -Sc`,
+`paru -Rns`, `apt-get` or `dnf`, so the tool itself asks for confirmation.
+
+### Safety
+
+- Only allow-listed commands run; no `--noconfirm`
+- Critical packages and this app's own dependencies are never removed
+- Direct deletion stays inside `$HOME`; `.ssh`, `.gnupg`, `.config` refused
+- The confirm dialog lists every action; Cancel is the default
+
+### Files
+
+- `disk-cleaner`: the app (scan, safety guard, deletion, GUI)
+- `test_disk_cleaner.py`: tests, no GUI and no root
+- `disk-cleaner.svg`, `disk-cleaner.desktop`, `install.sh`
+
+## Prerequisites
+
+- Linux desktop, `sudo`, and pacman, apt or dnf
+- Python 3.10+
+- A terminal emulator (`$TERMINAL`, terminator, gnome-terminal, ...)
+- `du`, `find`, `git`
+- GTK3 and cairo bindings for Python:
+  - Arch: `python-gobject gtk3 python-cairo`
+  - Debian/Ubuntu: `python3-gi python3-gi-cairo gir1.2-gtk-3.0`
+  - Fedora: `python3-gobject gtk3 python3-cairo`
+
+## Setup
+
+```sh
+git clone https://github.com/3tty0n/linux-disk-cleaner.git
+cd linux-disk-cleaner
+python3 test_disk_cleaner.py   # run the tests
+./disk-cleaner --list          # dry run: list candidates, delete nothing
+./disk-cleaner                 # run the GUI from the checkout
+```
 
 ## Install
+
 ```sh
-./install.sh            # ~/.local/{bin,share} + icon + desktop entry; PREFIX=/usr/local sudo ./install.sh for system-wide
-disk-cleaner            # GUI (or launch "Disk Cleaner" from the app menu)
-disk-cleaner --list     # print candidates, no GUI
-python3 test_disk_cleaner.py
+./install.sh                   # per user, into ~/.local
+PREFIX=/usr/local sudo ./install.sh   # system-wide
 ```
-Dependencies: `python-gobject gtk3 python-cairo` (Arch) · `python3-gi python3-gi-cairo gir1.2-gtk-3.0` (Debian/Ubuntu) ·
-`python3-gobject gtk3 python3-cairo` (Fedora). A terminal emulator (`$TERMINAL`, terminator, xfce4-terminal,
-gnome-terminal, konsole, alacritty, kitty, foot, xterm) is needed for package-manager actions.
+
+Start it from the app menu or with `disk-cleaner`.
+
+Uninstall:
+
+```sh
+rm ~/.local/bin/disk-cleaner
+rm ~/.local/share/applications/disk-cleaner.desktop
+rm ~/.local/share/icons/hicolor/scalable/apps/disk-cleaner.svg
+```
+
+## License
+
+[MIT](LICENSE) (c) 2026 YUSUKE IZAWA

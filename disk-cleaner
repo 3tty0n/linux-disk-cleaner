@@ -115,11 +115,11 @@ def delete(target, kind):
         return run_in_terminal(target)
     for t in target.split("\n"):  # several paths
         if kind == "clear":  # empty the dir, keep the dir itself
-            subprocess.run(["chmod", "-R", "u+w", t])  # makepkg/go leave read-only dirs
+            subprocess.run(["chmod", "-R", "u+rwX", t])  # makepkg/go leave read-only (even unreadable) dirs
             for e in os.scandir(t):
                 delete(e.path, "rm")
         elif os.path.isdir(t) and not os.path.islink(t):
-            subprocess.run(["chmod", "-R", "u+w", t])
+            subprocess.run(["chmod", "-R", "u+rwX", t])
             shutil.rmtree(t)
         else:
             os.unlink(t)

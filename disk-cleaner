@@ -3,11 +3,25 @@
 
 disk-cleaner          GUI
 disk-cleaner --list   print candidates, no GUI (smoke test)
+
+Anything pacman/root owns is never unlinked directly: it runs as a pacman/paru/sudo
+command in a terminal so the tool itself asks for confirmation.
 """
-import glob, os, shlex, shutil, subprocess, sys, threading
+import glob, math, os, re, shutil, subprocess, sys, threading, warnings
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)  # GTK3 style-context getters
 
 HOME = os.path.expanduser("~")
 BIG = "500M"  # large-file search threshold (find -size syntax)
+REMOVE = "paru -Rns" if shutil.which("paru") else "sudo pacman -Rns"
+# terminal -> args before the command; first one found wins ($TERMINAL first)
+TERMS = {"terminator": ["-u", "-x"], "xfce4-terminal": ["--disable-server", "-x"],
+         "alacritty": ["-e"], "kitty": [], "xterm": ["-e"]}
+# dataviz reference palette (validated light/dark, 7 slots) + neutral for "Other"
+PALETTE = {"light": ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6"],
+           "dark": ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9"]}
+OTHER = "#8a8a85"
+SLOTS = 7
 
 
 def du(path):
@@ -20,6 +34,17 @@ def human(n):
         if n < 1024 or u == "T":
             return f"{n:.1f} {u}" if u != "B" else f"{n} B"
         n /= 1024
+
+
+def pkg_owner(path):
+    r = subprocess.run(["pacman", "-Qqo", path], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def pkg_size(pkgs):
+    r = subprocess.run(["pacman", "-Qi", *pkgs], capture_output=True, text=True, env={**os.environ, "LC_ALL": "C"})
+    unit = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30}
+    return sum(int(float(n) * unit[u]) for n, u in re.findall(r"Installed Size\s*:\s*([\d.]+) (\w+)", r.stdout))
 
 
 def paru_artifacts(clone):
@@ -35,11 +60,12 @@ def paru_artifacts(clone):
 
 
 def scan():
-    """Yield (label, target, size, kind). kind: rm=delete paths, clear=empty dirs (keep them), cmd=run as root."""
+    """Yield (label, target, size, kind). kind: rm=delete paths, clear=empty dirs (keep them),
+    cmd=shell command run in a terminal (pacman/paru/sudo; they ask for confirmation)."""
     p = lambda *a: os.path.join(HOME, *a)
     if os.path.isdir(p(".cache")):
         for e in sorted(os.scandir(p(".cache")), key=lambda e: e.name):
-            if e.name == "paru":  # keep clones (PKGBUILDs/diff history), drop only build dirs
+            if e.name == "paru":  # keep clones (PKGBUILDs/diff history), drop only build artifacts
                 continue
             yield f"cache: {e.name}", e.path, du(e.path), "clear"
     for label, path in [
@@ -53,21 +79,40 @@ def scan():
     build = paru_artifacts(p(".cache/paru/clone"))
     if build:
         yield "paru build artifacts (untracked in clone/*)", "\n".join(build), sum(map(du, build)), "rm"
-    yield "pacman cache (uninstalled pkgs/old versions)", "pacman -Sc --noconfirm", du("/var/cache/pacman/pkg"), "cmd"
-    yield "systemd journal (keep 200M)", "journalctl --vacuum-size=200M", du("/var/log/journal"), "cmd"
+    yield "pacman cache (uninstalled pkgs/old versions)", "sudo pacman -Sc", du("/var/cache/pacman/pkg"), "cmd"
+    yield "systemd journal (keep 200M)", "sudo journalctl --vacuum-size=200M", du("/var/log/journal"), "cmd"
+    r = subprocess.run(["pacman", "-Qdtq"], capture_output=True, text=True)
+    if orphans := r.stdout.split():
+        yield f"orphan packages ({len(orphans)})", f"{REMOVE} $(pacman -Qdtq)", pkg_size(orphans), "cmd"
+    seen = set()
     r = subprocess.run(
         ["find", HOME, "-xdev", "-type", "f", "-size", f"+{BIG}",
          "-not", "-path", p(".cache/*"), "-not", "-path", p(".local/share/Trash/*"),
          "-printf", "%s\t%p\n"], capture_output=True, text=True)
     for line in r.stdout.splitlines():
         s, f = line.split("\t", 1)
-        yield f"big file: {os.path.relpath(f, HOME)}", f, int(s), "rm"
+        rel = os.path.relpath(f, HOME)
+        if owner := pkg_owner(f):  # pacman-owned: remove the package, never the file
+            if owner not in seen:
+                seen.add(owner)
+                yield f"package {owner} (owns big file ~/{rel})", f"{REMOVE} {owner}", int(s), "cmd"
+        else:
+            yield f"big file: {rel}", f, int(s), "rm"
+
+
+def run_in_terminal(cmd):
+    pref = os.path.basename(os.environ.get("TERMINAL", ""))
+    for t in [pref, *TERMS]:
+        if t in TERMS and shutil.which(t):
+            script = 'echo "$ $1"; eval "$1"; rc=$?; echo; read -rp "exit $rc - press Enter to close " _'
+            subprocess.run([t, *TERMS[t], "bash", "-c", script, "_", cmd])
+            return
+    raise RuntimeError(f"no terminal found ({', '.join(TERMS)}); run manually: {cmd}")
 
 
 def delete(target, kind):
     if kind == "cmd":
-        subprocess.run(["pkexec", *shlex.split(target)], check=True)
-        return
+        return run_in_terminal(target)
     for t in target.split("\n"):  # several paths
         if kind == "clear":  # empty the dir, keep the dir itself
             subprocess.run(["chmod", "-R", "u+w", t])  # makepkg/go leave read-only dirs
@@ -83,36 +128,132 @@ def delete(target, kind):
 def gui():
     import gi
     gi.require_version("Gtk", "3.0")
-    from gi.repository import GLib, GObject, Gtk
+    gi.require_version("Gdk", "3.0")
+    from gi.repository import GLib, GObject, Gdk, Gtk
 
     store = Gtk.ListStore(bool, str, GObject.TYPE_INT64, str, str)  # sel, label, size, target, kind
     status = Gtk.Label(xalign=0)
-    win = Gtk.Window(title="Disk Cleaner", default_width=900, default_height=600)
+    usage = Gtk.ProgressBar(show_text=True)
+    win = Gtk.Window(title="Disk Cleaner", default_width=1150, default_height=650)
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=8)
     win.add(box)
+    cache = {}  # memoised layout, cleared whenever sizes change
 
-    def refresh_status(msg=""):
+    def is_dark():
+        c = tree.get_style_context().get_color(Gtk.StateFlags.NORMAL)
+        return (c.red + c.green + c.blue) / 3 > 0.5
+
+    def layout():
+        """Top SLOTS rows by size, rest folded into one grey 'Other' slice."""
+        if "l" not in cache:
+            pal = PALETTE["dark" if is_dark() else "light"]
+            rows = sorted(store, key=lambda r: -r[2])
+            top, rest = (rows[:SLOTS], rows[SLOTS:]) if len(rows) > SLOTS + 1 else (rows, [])
+            out = [dict(label=r[1], size=r[2], color=pal[i], rows=[r]) for i, r in enumerate(top)]
+            if rest:
+                out.append(dict(label=f"Other ({len(rest)} items)", size=sum(r[2] for r in rest), color=OTHER, rows=rest))
+            cache["l"] = out
+            cache["colors"] = {s["rows"][0][1]: s["color"] for s in out if len(s["rows"]) == 1}
+        return cache["l"]
+
+    def rgb(h):
+        return tuple(int(h[i:i + 2], 16) / 255 for i in (1, 3, 5))
+
+    def refresh(msg=""):
         u = shutil.disk_usage("/")
+        usage.set_fraction(u.used / u.total)
+        usage.set_text(f"/  {human(u.used)} used of {human(u.total)}  ({human(u.free)} free)")
         sel = sum(r[2] for r in store if r[0])
-        status.set_text(f"/ free {human(u.free)} of {human(u.total)}  |  selected {human(sel)}  {msg}")
+        status.set_text(f"selected {human(sel)}  {msg}")
+        cache.clear()
+        pie.queue_draw()
+        tree.queue_draw()
+
+    pie = Gtk.DrawingArea(width_request=380, height_request=380)
+    pie.add_events(Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+    geom = {}
+
+    def draw(area, cr):
+        w, h = area.get_allocated_width(), area.get_allocated_height()
+        cx, cy = w / 2, h / 2
+        R = min(w, h) / 2 - 20
+        r = R * 0.58
+        sc = tree.get_style_context()
+        fg, bg = sc.get_color(Gtk.StateFlags.NORMAL), sc.get_background_color(Gtk.StateFlags.NORMAL)
+        sl = layout()
+        total = sum(s["size"] for s in sl)
+        geom.update(cx=cx, cy=cy, R=R, r=r, slices=[])
+        if total:
+            a = 0.0
+            for s in sl:
+                da = 2 * math.pi * s["size"] / total
+                mid, off = a + da / 2 - math.pi / 2, (10 if any(x[0] for x in s["rows"]) else 0)  # selected slices pop out
+                ox, oy = cx + off * math.cos(mid), cy + off * math.sin(mid)
+                cr.new_path()
+                cr.arc(ox, oy, R, a - math.pi / 2, a + da - math.pi / 2)
+                cr.arc_negative(ox, oy, r, a + da - math.pi / 2, a - math.pi / 2)
+                cr.close_path()
+                cr.set_source_rgb(*rgb(s["color"]))
+                cr.fill_preserve()
+                cr.set_source_rgb(bg.red, bg.green, bg.blue)  # 2px surface gap between slices
+                cr.set_line_width(2)
+                cr.stroke()
+                geom["slices"].append((a, a + da, s, s["size"] / total))
+                a += da
+        sel = sum(x[2] for x in store if x[0])
+        lines = [("selected" if sel else "reclaimable", 12), (human(sel if sel else total), 22)]
+        y = cy - 4
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, 1)
+        for text, size in lines:
+            cr.set_font_size(size)
+            ext = cr.text_extents(text)
+            cr.move_to(cx - ext.width / 2 - ext.x_bearing, y)
+            cr.show_text(text)
+            y += size + 6
+
+    def slice_at(ev):
+        dx, dy = ev.x - geom.get("cx", 0), ev.y - geom.get("cy", 0)
+        if not geom.get("slices") or not geom["r"] <= math.hypot(dx, dy) <= geom["R"] + 10:
+            return None
+        ang = (math.atan2(dy, dx) + math.pi / 2) % (2 * math.pi)
+        return next((x for x in geom["slices"] if x[0] <= ang < x[1]), None)
+
+    def on_motion(_, ev):
+        x = slice_at(ev)
+        pie.set_tooltip_text(f"{x[2]['label']}\n{human(x[2]['size'])}  ({x[3]:.0%})" if x else None)
+
+    def on_click(_, ev):
+        x = slice_at(ev)
+        if x and len(x[2]["rows"]) == 1:
+            x[2]["rows"][0][0] = not x[2]["rows"][0][0]
+            refresh()
+
+    pie.connect("draw", draw)
+    pie.connect("motion-notify-event", on_motion)
+    pie.connect("button-press-event", on_click)
 
     def on_toggle(_, path):
         store[path][0] = not store[path][0]
-        refresh_status()
+        refresh()
 
     tree = Gtk.TreeView(model=store)
     tog = Gtk.CellRendererToggle()
     tog.connect("toggled", on_toggle)
     tree.append_column(Gtk.TreeViewColumn("", tog, active=0))
-    tree.append_column(Gtk.TreeViewColumn("Item", Gtk.CellRendererText(), text=1))
+    dot = Gtk.TreeViewColumn("", Gtk.CellRendererText(text="●"))
+    layout_ready = lambda: (layout(), cache["colors"])[1]
+    dot.set_cell_data_func(dot.get_cells()[0], lambda c, r, m, i, _: r.set_property(
+        "foreground", layout_ready().get(m[i][1], OTHER)))
+    tree.append_column(dot)
+    tree.append_column(Gtk.TreeViewColumn("Item", Gtk.CellRendererText(ellipsize=3), text=1))
     size_col = Gtk.TreeViewColumn("Size", Gtk.CellRendererText(xalign=1), text=2)
     size_col.set_cell_data_func(size_col.get_cells()[0], lambda c, r, m, i, _: r.set_property("text", human(m[i][2])))
     size_col.set_sort_column_id(2)
     tree.append_column(size_col)
-    tree.get_column(1).set_expand(True)
-    tree.get_column(1).set_sort_column_id(1)
+    tree.get_column(2).set_expand(True)
+    tree.get_column(2).set_sort_column_id(1)
     store.set_sort_column_id(2, Gtk.SortType.DESCENDING)
-    sw = Gtk.ScrolledWindow(vexpand=True)
+    sw = Gtk.ScrolledWindow(vexpand=True, hexpand=True)
     sw.add(tree)
 
     scan_btn, del_btn = Gtk.Button(label="Rescan"), Gtk.Button(label="Delete selected")
@@ -120,13 +261,17 @@ def gui():
     bar.pack_start(status, True, True, 0)
     bar.pack_end(del_btn, False, False, 0)
     bar.pack_end(scan_btn, False, False, 0)
-    box.pack_start(sw, True, True, 0)
+    main = Gtk.Box(spacing=8)
+    main.pack_start(pie, False, False, 0)
+    main.pack_start(sw, True, True, 0)
+    box.pack_start(usage, False, False, 0)
+    box.pack_start(main, True, True, 0)
     box.pack_start(bar, False, False, 0)
 
     def add(label, target, size, kind):
         if size > 0:
             store.append([False, label, size, target, kind])
-        refresh_status("(scanning...)")
+        refresh("(scanning...)")
 
     def do_scan(_=None):
         store.clear()
@@ -135,28 +280,32 @@ def gui():
         def work():
             for row in scan():
                 GLib.idle_add(add, *row)
-            GLib.idle_add(lambda: (scan_btn.set_sensitive(True), refresh_status("done")))
+            GLib.idle_add(lambda: (scan_btn.set_sensitive(True), refresh("done")))
         threading.Thread(target=work, daemon=True).start()
 
     def do_delete(_):
         rows = [r for r in store if r[0]]
         if not rows:
             return
+        direct, cmds = [r for r in rows if r[4] != "cmd"], [r for r in rows if r[4] == "cmd"]
         d = Gtk.MessageDialog(transient_for=win, message_type=Gtk.MessageType.WARNING,
                               buttons=Gtk.ButtonsType.OK_CANCEL,
-                              text=f"Permanently delete {len(rows)} items ({human(sum(r[2] for r in rows))})?")
-        d.format_secondary_text("\n".join(r[1] for r in rows))
+                              text=f"Delete {len(rows)} items ({human(sum(r[2] for r in rows))})?")
+        d.format_secondary_text(
+            (f"Permanently deleted now:\n" + "\n".join(f"  {r[1]}" for r in direct) + "\n\n" if direct else "")
+            + (f"Run in a terminal (pacman/paru/sudo ask for confirmation there):\n"
+               + "\n".join(f"  {r[3]}" for r in cmds) if cmds else ""))
         ok = d.run() == Gtk.ResponseType.OK
         d.destroy()
         if not ok:
             return
-        jobs = [(r[1], r[3], r[4]) for r in rows]
+        jobs = [(r[1], r[3], r[4]) for r in direct + cmds]
         del_btn.set_sensitive(False)
 
         def work():
             errs = []
             for label, target, kind in jobs:
-                GLib.idle_add(refresh_status, f"deleting {label}...")
+                GLib.idle_add(refresh, f"deleting {label}...")
                 try:
                     delete(target, kind)
                 except Exception as e:

@@ -22,6 +22,18 @@ def human(n):
         n /= 1024
 
 
+def paru_artifacts(clone):
+    """Top-level entries of each paru clone that git doesn't track (src/, pkg/, sources, built packages)."""
+    out = []
+    for d in glob.glob(os.path.join(clone, "*")):
+        r = subprocess.run(["git", "-C", d, "ls-files", "-z"], capture_output=True)
+        if r.returncode:
+            continue  # not a git clone: leave alone
+        keep = {".git"} | {f.split(b"/")[0].decode() for f in r.stdout.split(b"\0") if f}
+        out += [e.path for e in os.scandir(d) if e.name not in keep]
+    return out
+
+
 def scan():
     """Yield (label, target, size, kind). kind: rm=delete path, clear=empty dir, cmd=run as root."""
     p = lambda *a: os.path.join(HOME, *a)
@@ -37,9 +49,9 @@ def scan():
     ]:
         if os.path.exists(path):
             yield label, path, du(path), "clear" if label == "trash" else "rm"
-    build = glob.glob(p(".cache/paru/clone/*/src")) + glob.glob(p(".cache/paru/clone/*/pkg"))
+    build = paru_artifacts(p(".cache/paru/clone"))
     if build:
-        yield "paru build dirs (src/pkg)", "\n".join(build), sum(map(du, build)), "rm"
+        yield "paru build artifacts (untracked in clone/*)", "\n".join(build), sum(map(du, build)), "rm"
     yield "pacman cache (uninstalled pkgs/old versions)", "pacman -Sc --noconfirm", du("/var/cache/pacman/pkg"), "cmd"
     yield "systemd journal (keep 200M)", "journalctl --vacuum-size=200M", du("/var/log/journal"), "cmd"
     r = subprocess.run(

@@ -1,7 +1,11 @@
 [Desktop Entry]
 Type=Application
 Name=Disk Cleaner
-Comment=Find and delete disposable files
+GenericName=Disk space cleaner
+Comment=Find and delete disposable files to free disk space
 Exec=disk-cleaner
-Icon=drive-harddisk
-Categories=System;Utility;
+Icon=disk-cleaner
+Terminal=false
+Categories=System;Filesystem;
+Keywords=disk;cleanup;cache;trash;storage;space;
+StartupWMClass=disk-cleaner

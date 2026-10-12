@@ -2,30 +2,197 @@
 """GUI to find and delete disposable files (caches, trash, old packages, big files).
 
 disk-cleaner          GUI
-disk-cleaner --list   print candidates, no GUI (smoke test)
+disk-cleaner --list   print candidates and problems, no GUI (smoke test)
 
-Anything pacman/root owns is never unlinked directly: it runs as a pacman/paru/sudo
-command in a terminal so the tool itself asks for confirmation.
+Safety: nothing outside $HOME is ever unlinked directly, protected dirs are refused, and anything the
+package manager/root owns runs as an allow-listed pacman/paru/apt/dnf/sudo command in a terminal so
+the tool itself asks for confirmation. Failures are explained in the GUI; nothing is logged to the CLI.
 """
-import glob, math, os, re, shutil, subprocess, sys, threading, warnings
+import collections, glob, math, os, pwd, re, shutil, stat, subprocess, sys, tempfile, threading, traceback, warnings
 
-warnings.filterwarnings("ignore", category=DeprecationWarning)  # GTK3 style-context getters
+warnings.filterwarnings("ignore")  # GTK3 style-context getters etc.
 
 HOME = os.path.expanduser("~")
+CACHE = os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache")
+DATA = os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local/share")
 BIG = "500M"  # large-file search threshold (find -size syntax)
-REMOVE = "paru -Rns" if shutil.which("paru") else "sudo pacman -Rns"
 # terminal -> args before the command; first one found wins ($TERMINAL first)
-TERMS = {"terminator": ["-u", "-x"], "xfce4-terminal": ["--disable-server", "-x"],
-         "alacritty": ["-e"], "kitty": [], "xterm": ["-e"]}
+TERMS = {"terminator": ["-u", "-x"], "xfce4-terminal": ["--disable-server", "-x"], "gnome-terminal": ["--wait", "--"],
+         "konsole": ["--nofork", "-e"], "alacritty": ["-e"], "kitty": [], "foot": [], "xterm": ["-e"],
+         "x-terminal-emulator": ["-e"]}
 # dataviz reference palette (validated light/dark, 7 slots) + neutral for "Other"
 PALETTE = {"light": ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6"],
            "dark": ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9"]}
 OTHER = "#8a8a85"
 SLOTS = 7
 
+Issue = collections.namedtuple("Issue", "item raw cause hint")
+Row = collections.namedtuple("Row", "label target size kind note")  # kind: rm | clear | cmd
+ISSUES = {"scan": [], "run": []}
 
+
+class Refused(Exception):
+    pass
+
+
+class DeleteError(Exception):
+    def __init__(self, errors):  # [(path, exception)]
+        super().__init__(f"{len(errors)} errors")
+        self.errors = errors
+
+
+class CmdError(Exception):
+    def __init__(self, cmd, rc, err):
+        super().__init__(err.strip() or ("terminal closed before the command finished" if rc is None
+                                         else f"exit code {rc} (declined at the prompt?)"))
+        self.cmd, self.rc = cmd, rc
+
+
+# ---------------------------------------------------------------- explaining failures
+RULES = [  # (regex on the raw message, likely cause, what to do)
+    (r"unable to lock database|could not lock|Could not get lock|dpkg frontend lock|lock .*held|waiting for .*lock|db\.lck",
+     "Another package manager is running (or crashed and left a lock file).",
+     "Close it and retry. If none is running, remove the stale lock (pacman: sudo rm /var/lib/pacman/db.lck)."),
+    (r"a password is required|Authentication failure|incorrect password|no tty present|not in the sudoers",
+     "sudo authentication failed.", "Retry and type your password in the terminal; make sure your user is in wheel/sudo."),
+    (r"target not found|Unable to locate package|No match for argument|no package .*installed|is not installed",
+     "The package no longer exists or was already removed.", "Rescan and try again."),
+    (r"breaks dependency|is required by|unmet dependenc|dependency problems|Problem: .*requires|Depends:",
+     "Other installed packages still depend on it.", "Remove the dependents first, or leave this one installed."),
+    (r"conflicting files|failed to commit transaction|file conflicts",
+     "Files conflict with another package.", "Read the conflicting paths above and resolve them manually."),
+    (r"no targets specified|nothing to do|Nothing to do|0 to remove",
+     "Nothing left to remove (already clean).", "Rescan."),
+    (r"command not found|No such file or directory.*(paru|yay|pacman|apt|dnf|journalctl|sudo)",
+     "A required tool is not installed.", "Install it, or deselect this item."),
+    (r"Read-only file system", "The filesystem is mounted read-only.", "Remount it read-write or check the disk (dmesg)."),
+    (r"No space left", "The disk is completely full.", "Free a little space manually first (e.g. empty the trash)."),
+    (r"busy|EBUSY", "The file is in use by a running program.", "Close the program using it (lsof +D <path>) and retry."),
+    (r"Failed to (vacuum|rotate)|journal.*(Permission|denied)", "journalctl needs root.", "Run it via sudo in the terminal."),
+]
+
+
+def why_denied(path):
+    """(cause, hint) for a permission error on path, from the real file state."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        st = None
+    if st and st.st_uid != os.getuid():
+        try:
+            owner = pwd.getpwuid(st.st_uid).pw_name
+        except KeyError:
+            owner = str(st.st_uid)
+        return f"The file is owned by '{owner}', not by you.", f"After checking the path: sudo rm -rf '{path}'"
+    parent = os.path.dirname(path)
+    if not os.access(parent, os.W_OK | os.X_OK):
+        return "The parent directory is not writable.", f"chmod u+w '{parent}'"
+    if st and stat.S_ISDIR(st.st_mode) and not os.access(path, os.R_OK | os.X_OK):
+        return "The directory has no read/execute permission (e.g. mode 311).", f"chmod -R u+rwX '{path}'"
+    return ("Permission denied by an immutable attribute, ACL or security module (SELinux/AppArmor).",
+            "Check lsattr/getfacl; for immutable files: sudo chattr -i <path>")
+
+
+def issue(item, raw, path=None):
+    raw = " ".join(str(raw).split())[:400]
+    if path and re.search(r"Permission denied|Operation not permitted|EACCES|EPERM", raw):
+        return Issue(item, raw, *why_denied(path))
+    for rx, cause, hint in RULES:
+        if re.search(rx, raw, re.I):
+            return Issue(item, raw, cause, hint)
+    return Issue(item, raw, "Unknown.", "Run the command by hand and read its output.")
+
+
+def note_scan_errors(item, stderr):
+    for line in stderr.splitlines():
+        m = re.search(r"'([^']+)': (Permission denied|Operation not permitted)", line) or re.search(r"(/\S+): (Permission denied)", line)
+        if m and m.group(1).startswith(HOME + os.sep):  # system dirs are handled by root commands: not actionable
+            ISSUES["scan"].append(issue(item, line, m.group(1)))
+
+
+# ---------------------------------------------------------------- safety
+PKG = r"[\w@+][\w.+@:-]*"
+ALLOWED_CMD = re.compile(
+    rf"sudo pacman -Sc|sudo journalctl --vacuum-size=\d+[KMG]|(paru|yay|sudo pacman) -Rns (\$\(pacman -Qdtq\)|{PKG})"
+    rf"|sudo apt-get (clean|autoremove --purge|remove {PKG})|sudo dnf (clean all|autoremove|remove {PKG})")
+PROTECTED = [os.path.join(HOME, p) for p in (
+    ".ssh", ".gnupg", ".config", ".local", ".password-store", ".mozilla", ".thunderbird", "Documents", "Desktop",
+    "Pictures", "Music", "Videos", "Downloads", "src", ".xconfig")] + [CACHE, DATA, os.path.join(DATA, "Trash")]
+
+
+def check_safe(target, kind):
+    """Raise Refused unless every target is allow-listed. Defence in depth: scan() only yields safe rows."""
+    if kind == "cmd":
+        if not ALLOWED_CMD.fullmatch(target):
+            raise Refused(f"command not on the allow-list: {target}")
+        return
+    for t in target.split("\n"):
+        # a symlink is only unlinked, so judge where it lives; anything else by its real location
+        p = os.path.abspath(t) if os.path.islink(t) else os.path.realpath(t)
+        if os.path.commonpath([p, HOME]) != HOME or p == HOME:
+            raise Refused(f"outside your home directory: {t}")
+        if any(p == q or q.startswith(p + os.sep) for q in map(os.path.realpath, PROTECTED)):
+            raise Refused(f"protected directory (or contains one): {t}")
+        if os.path.ismount(p):
+            raise Refused(f"mount point: {t}")
+
+
+# ---------------------------------------------------------------- package managers
+def out(*cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, "LC_ALL": "C"}).stdout
+    except OSError:
+        return ""
+
+
+def _pacman():
+    helper = next((h for h in ("paru", "yay") if shutil.which(h)), "sudo pacman")
+    unit = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30}
+    base = lambda: set(out("pacman", "-Qqg", "base").split())
+    return dict(
+        name="pacman", cache_dir="/var/cache/pacman/pkg", clean="sudo pacman -Sc",
+        remove=lambda p: f"{helper} -Rns {p}", autoremove=f"{helper} -Rns $(pacman -Qdtq)",
+        owner=lambda f: out("pacman", "-Qqo", f).strip(), orphans=lambda: out("pacman", "-Qdtq").split(),
+        size=lambda ps: sum(int(float(n) * unit[u]) for n, u in re.findall(r"Installed Size\s*:\s*([\d.]+) (\w+)", out("pacman", "-Qi", *ps))),
+        critical=lambda p: p in base() or p.startswith("linux") or p in {"pacman", "paru", "yay", "sudo", "glibc", "systemd"},
+        explicit=lambda p: p in out("pacman", "-Qqe").split())
+
+
+def _apt():
+    return dict(
+        name="apt", cache_dir="/var/cache/apt/archives", clean="sudo apt-get clean",
+        remove=lambda p: f"sudo apt-get remove {p}", autoremove="sudo apt-get autoremove --purge",
+        owner=lambda f: out("dpkg", "-S", f).split(":")[0].split(",")[0].strip(),
+        orphans=lambda: re.findall(r"^Remv (\S+)", out("apt-get", "-s", "autoremove"), re.M),
+        size=lambda ps: 1024 * sum(int(x) for x in out("dpkg-query", "-W", "-f", "${Installed-Size}\n", *ps).split() if x.isdigit()),
+        critical=lambda p: out("dpkg-query", "-W", "-f", "${Essential}", p) == "yes" or re.match(r"linux-(image|modules|generic)|apt$|dpkg$|sudo$", p),
+        explicit=lambda p: p in out("apt-mark", "showmanual").split())
+
+
+def _dnf():
+    return dict(
+        name="dnf", cache_dir="/var/cache/dnf", clean="sudo dnf clean all",
+        remove=lambda p: f"sudo dnf remove {p}", autoremove="sudo dnf autoremove",
+        owner=lambda f: out("rpm", "-qf", "--qf", "%{NAME}", f).strip() if os.path.exists(f) else "",
+        orphans=lambda: out("dnf", "-q", "repoquery", "--unneeded").split(),
+        size=lambda ps: sum(int(x) for x in out("rpm", "-q", "--qf", "%{SIZE}\n", *ps).split() if x.isdigit()),
+        critical=lambda p: re.match(r"kernel|glibc|systemd|bash$|coreutils$|rpm$|dnf|sudo$|filesystem$", p),
+        explicit=lambda p: False)
+
+
+PM = next((f() for b, f in (("pacman", _pacman), ("apt-get", _apt), ("dnf", _dnf)) if shutil.which(b)), None)
+
+
+def self_packages():
+    """Packages this program itself runs on: never offer to remove them."""
+    import gi, cairo
+    return {PM["owner"](f) for f in (os.path.realpath(sys.executable), gi.__file__, cairo.__file__)} - {""}
+
+
+# ---------------------------------------------------------------- scanning
 def du(path):
     r = subprocess.run(["du", "-sxb", path], capture_output=True, text=True)
+    note_scan_errors(path, r.stderr)
     return int(r.stdout.split()[0]) if r.stdout else 0
 
 
@@ -36,93 +203,140 @@ def human(n):
         n /= 1024
 
 
-def pkg_owner(path):
-    r = subprocess.run(["pacman", "-Qqo", path], capture_output=True, text=True)
-    return r.stdout.strip() if r.returncode == 0 else None
-
-
-def pkg_size(pkgs):
-    r = subprocess.run(["pacman", "-Qi", *pkgs], capture_output=True, text=True, env={**os.environ, "LC_ALL": "C"})
-    unit = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30}
-    return sum(int(float(n) * unit[u]) for n, u in re.findall(r"Installed Size\s*:\s*([\d.]+) (\w+)", r.stdout))
-
-
 def paru_artifacts(clone):
     """Top-level entries of each paru clone that git doesn't track (src/, pkg/, sources, built packages)."""
-    out = []
+    out_ = []
     for d in glob.glob(os.path.join(clone, "*")):
         r = subprocess.run(["git", "-C", d, "ls-files", "-z"], capture_output=True)
         if r.returncode:
             continue  # not a git clone: leave alone
         keep = {".git"} | {f.split(b"/")[0].decode() for f in r.stdout.split(b"\0") if f}
-        out += [e.path for e in os.scandir(d) if e.name not in keep]
-    return out
+        out_ += [e.path for e in os.scandir(d) if e.name not in keep]
+    return out_
 
 
 def scan():
-    """Yield (label, target, size, kind). kind: rm=delete paths, clear=empty dirs (keep them),
-    cmd=shell command run in a terminal (pacman/paru/sudo; they ask for confirmation)."""
+    """Yield Row. kind: rm=delete paths, clear=empty dirs (keep them), cmd=allow-listed command run in a terminal."""
+    ISSUES["scan"].clear()
     p = lambda *a: os.path.join(HOME, *a)
-    if os.path.isdir(p(".cache")):
-        for e in sorted(os.scandir(p(".cache")), key=lambda e: e.name):
-            if e.name == "paru":  # keep clones (PKGBUILDs/diff history), drop only build artifacts
-                continue
-            yield f"cache: {e.name}", e.path, du(e.path), "clear"
+    if os.path.isdir(CACHE):
+        for e in sorted(os.scandir(CACHE), key=lambda e: e.name):
+            if e.name != "paru":  # paru: see paru_artifacts
+                yield Row(f"cache: {e.name}", e.path, du(e.path), "clear", "")
     for label, path in [
-        ("trash", p(".local/share/Trash/files") + "\n" + p(".local/share/Trash/info")),
+        ("trash", os.path.join(DATA, "Trash/files") + "\n" + os.path.join(DATA, "Trash/info")),
         ("npm cache", p(".npm/_cacache")),
         ("cargo registry cache", p(".cargo/registry/cache")),
     ]:
         paths = [x for x in path.split("\n") if os.path.isdir(x)]
         if paths:
-            yield label, "\n".join(paths), sum(map(du, paths)), "clear"
-    build = paru_artifacts(p(".cache/paru/clone"))
-    if build:
-        yield "paru build artifacts (untracked in clone/*)", "\n".join(build), sum(map(du, build)), "rm"
-    yield "pacman cache (uninstalled pkgs/old versions)", "sudo pacman -Sc", du("/var/cache/pacman/pkg"), "cmd"
-    yield "systemd journal (keep 200M)", "sudo journalctl --vacuum-size=200M", du("/var/log/journal"), "cmd"
-    r = subprocess.run(["pacman", "-Qdtq"], capture_output=True, text=True)
-    if orphans := r.stdout.split():
-        yield f"orphan packages ({len(orphans)})", f"{REMOVE} $(pacman -Qdtq)", pkg_size(orphans), "cmd"
-    seen = set()
+            yield Row(label, "\n".join(paths), sum(map(du, paths)), "clear", "")
+    if build := paru_artifacts(os.path.join(CACHE, "paru/clone")):
+        yield Row("paru build artifacts (untracked in clone/*)", "\n".join(build), sum(map(du, build)), "rm",
+                  "Sources are downloaded again on the next build.")
+    if PM:
+        if os.path.isdir(PM["cache_dir"]):
+            yield Row(f"{PM['name']} package cache", PM["clean"], du(PM["cache_dir"]), "cmd", "")
+        if orphans := PM["orphans"]():
+            yield Row(f"unneeded packages ({len(orphans)})", PM["autoremove"], PM["size"](orphans), "cmd",
+                      "Read the package list the package manager prints before you confirm.")
+    if shutil.which("journalctl") and os.path.isdir("/var/log/journal"):
+        yield Row("systemd journal (keep 200M)", "sudo journalctl --vacuum-size=200M", du("/var/log/journal"), "cmd", "")
     r = subprocess.run(
-        ["find", HOME, "-xdev", "-type", "f", "-size", f"+{BIG}",
-         "-not", "-path", p(".cache/*"), "-not", "-path", p(".local/share/Trash/*"),
-         "-printf", "%s\t%p\n"], capture_output=True, text=True)
+        ["find", HOME, "-xdev", "-type", "f", "-size", f"+{BIG}", "-not", "-path", CACHE + "/*",
+         "-not", "-path", os.path.join(DATA, "Trash/*"), "-printf", "%s\t%p\n"], capture_output=True, text=True)
+    note_scan_errors(HOME, r.stderr)
+    keep = self_packages() if PM else set()
+    seen = set()
     for line in r.stdout.splitlines():
         s, f = line.split("\t", 1)
         rel = os.path.relpath(f, HOME)
-        if owner := pkg_owner(f):  # pacman-owned: remove the package, never the file
-            if owner not in seen:
-                seen.add(owner)
-                yield f"package {owner} (owns big file ~/{rel})", f"{REMOVE} {owner}", int(s), "cmd"
+        if any(f == q or f.startswith(q + os.sep) for q in map(os.path.realpath, PROTECTED[:4])):
+            continue  # ssh/gnupg/config/local data: never offered
+        owner = PM["owner"](f) if PM else ""
+        if owner:  # package-owned: remove the package (with confirmation), never the file
+            if owner in seen or owner in keep or PM["critical"](owner):
+                continue
+            seen.add(owner)
+            note = "Explicitly installed package." if PM["explicit"](owner) else ""
+            yield Row(f"package {owner} (owns big file ~/{rel})", PM["remove"](owner), int(s), "cmd", note)
         else:
-            yield f"big file: {rel}", f, int(s), "rm"
+            hidden = any(c.startswith(".") for c in rel.split(os.sep))
+            yield Row(f"big file: {rel}", f, int(s), "rm",
+                      "Permanent. Inside hidden app data: deleting it may corrupt or reset that app." if hidden
+                      else "Permanent. This looks like your own data.")
 
 
+# ---------------------------------------------------------------- deleting
 def run_in_terminal(cmd):
     pref = os.path.basename(os.environ.get("TERMINAL", ""))
-    for t in [pref, *TERMS]:
-        if t in TERMS and shutil.which(t):
-            script = 'echo "$ $1"; eval "$1"; rc=$?; echo; read -rp "exit $rc - press Enter to close " _'
-            subprocess.run([t, *TERMS[t], "bash", "-c", script, "_", cmd])
-            return
-    raise RuntimeError(f"no terminal found ({', '.join(TERMS)}); run manually: {cmd}")
+    d = tempfile.mkdtemp()
+    try:
+        for t in [pref, *TERMS]:
+            if t in TERMS and shutil.which(t):
+                script = ('bash -c "$1" 2> >(tee "$2/err" >&2); rc=$?; sleep 0.3; echo "$rc" > "$2/rc"; '
+                          'echo; read -rp "exit $rc - press Enter to close " _')
+                subprocess.run([t, *TERMS[t], "bash", "-c", script, "_", cmd, d],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                break
+        else:
+            raise CmdError(cmd, 1, f"no terminal found ({', '.join(TERMS)}); run it by hand: {cmd}")
+        rd = lambda n: open(os.path.join(d, n)).read() if os.path.exists(os.path.join(d, n)) else ""
+        rc = int(rd("rc").strip()) if rd("rc").strip() else None
+        if rc != 0:
+            raise CmdError(cmd, rc, rd("err"))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def delete(target, kind):
+    check_safe(target, kind)
     if kind == "cmd":
         return run_in_terminal(target)
-    for t in target.split("\n"):  # several paths
+    errors = []
+    for t in target.split("\n"):
         if kind == "clear":  # empty the dir, keep the dir itself
-            subprocess.run(["chmod", "-R", "u+rwX", t])  # makepkg/go leave read-only (even unreadable) dirs
+            subprocess.run(["chmod", "-R", "u+rwX", t], capture_output=True)  # makepkg/go leave read-only dirs
             for e in os.scandir(t):
-                delete(e.path, "rm")
+                try:
+                    delete(e.path, "rm")
+                except DeleteError as x:
+                    errors += x.errors
         elif os.path.isdir(t) and not os.path.islink(t):
-            subprocess.run(["chmod", "-R", "u+rwX", t])
-            shutil.rmtree(t)
+            subprocess.run(["chmod", "-R", "u+rwX", t], capture_output=True)
+            shutil.rmtree(t, onerror=lambda f, path, ei: errors.append((path, ei[1])))
         else:
-            os.unlink(t)
+            try:
+                os.unlink(t)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                errors.append((t, e))
+    if errors:
+        raise DeleteError(errors)
+
+
+def issues_text(items):
+    return "\n\n".join(f"■ {i.item}\n  What happened: {i.raw}\n  Likely cause:  {i.cause}\n  What to do:    {i.hint}"
+                        for i in items)
+
+
+def run_job(row):
+    """Delete one row; return a list of Issue (empty on success)."""
+    try:
+        delete(row.target, row.kind)
+    except DeleteError as e:
+        first = [issue(row.label, x, p) for p, x in e.errors[:3]]
+        if len(e.errors) > 3:
+            first.append(Issue(row.label, f"...and {len(e.errors) - 3} more failures", "Same kind of problem as above.", ""))
+        return first
+    except Refused as e:
+        return [Issue(row.label, str(e), "Blocked by the safety guard; nothing was deleted.", "Delete it by hand if you are sure.")]
+    except CmdError as e:
+        return [issue(f"{row.label}  ({e.cmd})", str(e))]
+    except Exception as e:
+        return [issue(row.label, f"{type(e).__name__}: {e}")]
+    return []
 
 
 def gui():
@@ -131,10 +345,21 @@ def gui():
     gi.require_version("Gdk", "3.0")
     from gi.repository import GLib, GObject, Gdk, Gtk
 
-    store = Gtk.ListStore(bool, str, GObject.TYPE_INT64, str, str)  # sel, label, size, target, kind
+    try:  # GTK/GLib warnings are noise on the CLI
+        GLib.log_set_writer_func(lambda *a: GLib.LogWriterOutput.HANDLED, None)
+    except Exception:
+        pass
+    GLib.set_prgname("disk-cleaner")
+    GLib.set_application_name("Disk Cleaner")
+    here = os.path.dirname(os.path.realpath(__file__))
+    icon = next((f for f in (os.path.join(here, "disk-cleaner.svg"),) if os.path.exists(f)), None)
+    if icon:  # fallback when the icon theme entry is not installed
+        Gtk.Window.set_default_icon_from_file(icon)
+
+    store = Gtk.ListStore(bool, str, GObject.TYPE_INT64, str, str, str)  # sel, label, size, target, kind, note
     status = Gtk.Label(xalign=0)
     usage = Gtk.ProgressBar(show_text=True)
-    win = Gtk.Window(title="Disk Cleaner", default_width=1150, default_height=650)
+    win = Gtk.Window(title="Disk Cleaner", default_width=1150, default_height=650, icon_name="disk-cleaner")
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=8)
     win.add(box)
     cache = {}  # memoised layout, cleared whenever sizes change
@@ -245,22 +470,28 @@ def gui():
     dot.set_cell_data_func(dot.get_cells()[0], lambda c, r, m, i, _: r.set_property(
         "foreground", layout_ready().get(m[i][1], OTHER)))
     tree.append_column(dot)
-    tree.append_column(Gtk.TreeViewColumn("Item", Gtk.CellRendererText(ellipsize=3), text=1))
+    warn = Gtk.TreeViewColumn("", Gtk.CellRendererText(foreground="#eda100"))
+    warn.set_cell_data_func(warn.get_cells()[0], lambda c, r, m, i, _: r.set_property("text", "⚠" if m[i][5] else ""))
+    tree.append_column(warn)
+    tree.set_tooltip_column(5)
+    item_col = Gtk.TreeViewColumn("Item", Gtk.CellRendererText(ellipsize=3), text=1)
+    item_col.set_expand(True)
+    item_col.set_sort_column_id(1)
+    tree.append_column(item_col)
     size_col = Gtk.TreeViewColumn("Size", Gtk.CellRendererText(xalign=1), text=2)
     size_col.set_cell_data_func(size_col.get_cells()[0], lambda c, r, m, i, _: r.set_property("text", human(m[i][2])))
     size_col.set_sort_column_id(2)
     tree.append_column(size_col)
-    tree.get_column(2).set_expand(True)
-    tree.get_column(2).set_sort_column_id(1)
     store.set_sort_column_id(2, Gtk.SortType.DESCENDING)
     sw = Gtk.ScrolledWindow(vexpand=True, hexpand=True)
     sw.add(tree)
 
-    scan_btn, del_btn = Gtk.Button(label="Rescan"), Gtk.Button(label="Delete selected")
+    scan_btn, del_btn, issues_btn = Gtk.Button(label="Rescan"), Gtk.Button(label="Delete selected"), Gtk.Button()
     bar = Gtk.Box(spacing=6)
     bar.pack_start(status, True, True, 0)
     bar.pack_end(del_btn, False, False, 0)
     bar.pack_end(scan_btn, False, False, 0)
+    bar.pack_end(issues_btn, False, False, 0)
     main = Gtk.Box(spacing=8)
     main.pack_start(pie, False, False, 0)
     main.pack_start(sw, True, True, 0)
@@ -268,60 +499,95 @@ def gui():
     box.pack_start(main, True, True, 0)
     box.pack_start(bar, False, False, 0)
 
-    def add(label, target, size, kind):
-        if size > 0:
-            store.append([False, label, size, target, kind])
+    def all_issues():
+        return ISSUES["run"] + ISSUES["scan"]
+
+    def update_issues_btn():
+        n = len(all_issues())
+        issues_btn.set_label(f"⚠ Problems ({n})")
+        issues_btn.set_visible(n > 0)
+
+    def show_issues(items):
+        d = Gtk.Dialog(title="Problems", transient_for=win, default_width=780, default_height=480)
+        d.add_button("Close", Gtk.ResponseType.CLOSE)
+        text = issues_text(items)
+        tv = Gtk.TextView(editable=False, monospace=True, wrap_mode=Gtk.WrapMode.WORD, left_margin=10, top_margin=10)
+        tv.get_buffer().set_text(text)
+        sw_ = Gtk.ScrolledWindow(vexpand=True)
+        sw_.add(tv)
+        d.get_content_area().pack_start(sw_, True, True, 0)
+        d.show_all()
+        d.run()
+        d.destroy()
+
+    def crash(et, ev, tb):  # unexpected exceptions are shown, not printed
+        ISSUES["run"].append(Issue("internal error", "".join(traceback.format_exception_only(et, ev)),
+                                   "A bug in disk-cleaner.", "Report it with the text above."))
+        GLib.idle_add(update_issues_btn)
+    sys.excepthook = crash
+    threading.excepthook = lambda a: crash(a.exc_type, a.exc_value, a.exc_traceback)
+
+    def add(row):
+        if row.size > 0:
+            store.append([False, row.label, row.size, row.target, row.kind, row.note])
         refresh("(scanning...)")
 
     def do_scan(_=None):
         store.clear()
         scan_btn.set_sensitive(False)
 
+        def done():
+            scan_btn.set_sensitive(True)
+            update_issues_btn()
+            n = len(ISSUES["scan"])
+            refresh("done" + (f" - {n} unreadable paths, sizes may be low" if n else ""))
+
         def work():
-            for row in scan():
-                GLib.idle_add(add, *row)
-            GLib.idle_add(lambda: (scan_btn.set_sensitive(True), refresh("done")))
+            try:
+                for row in scan():
+                    GLib.idle_add(add, row)
+            finally:
+                GLib.idle_add(done)
         threading.Thread(target=work, daemon=True).start()
 
     def do_delete(_):
-        rows = [r for r in store if r[0]]
+        rows = [Row(r[1], r[3], r[2], r[4], r[5]) for r in store if r[0]]
         if not rows:
             return
-        direct, cmds = [r for r in rows if r[4] != "cmd"], [r for r in rows if r[4] == "cmd"]
+        direct, cmds = [r for r in rows if r.kind != "cmd"], [r for r in rows if r.kind == "cmd"]
         d = Gtk.MessageDialog(transient_for=win, message_type=Gtk.MessageType.WARNING,
                               buttons=Gtk.ButtonsType.OK_CANCEL,
-                              text=f"Delete {len(rows)} items ({human(sum(r[2] for r in rows))})?")
+                              text=f"Delete {len(rows)} items ({human(sum(r.size for r in rows))})?")
+        warns = [f"⚠ {r.label}: {r.note}" for r in rows if r.note]
         d.format_secondary_text(
-            (f"Permanently deleted now:\n" + "\n".join(f"  {r[1]}" for r in direct) + "\n\n" if direct else "")
-            + (f"Run in a terminal (pacman/paru/sudo ask for confirmation there):\n"
-               + "\n".join(f"  {r[3]}" for r in cmds) if cmds else ""))
+            (("Permanently deleted now:\n" + "\n".join(f"  {r.label}" for r in direct) + "\n\n") if direct else "")
+            + (("Run in a terminal (the package manager / sudo asks for confirmation there):\n"
+                + "\n".join(f"  {r.target}" for r in cmds) + "\n\n") if cmds else "")
+            + "\n".join(warns))
+        d.set_default_response(Gtk.ResponseType.CANCEL)
         ok = d.run() == Gtk.ResponseType.OK
         d.destroy()
         if not ok:
             return
-        jobs = [(r[1], r[3], r[4]) for r in direct + cmds]
         del_btn.set_sensitive(False)
+        ISSUES["run"].clear()
 
         def work():
-            errs = []
-            for label, target, kind in jobs:
-                GLib.idle_add(refresh, f"deleting {label}...")
-                try:
-                    delete(target, kind)
-                except Exception as e:
-                    errs.append(f"{label}: {e}")
-            GLib.idle_add(finish, errs)
+            for r in direct + cmds:
+                GLib.idle_add(refresh, f"deleting {r.label}...")
+                ISSUES["run"] += run_job(r)
+            GLib.idle_add(finish)
 
-        def finish(errs):
+        def finish():
             del_btn.set_sensitive(True)
-            if errs:
-                m = Gtk.MessageDialog(transient_for=win, message_type=Gtk.MessageType.ERROR,
-                                      buttons=Gtk.ButtonsType.CLOSE, text="Some deletions failed")
-                m.format_secondary_text("\n".join(errs))
-                m.run(); m.destroy()
+            update_issues_btn()
+            if ISSUES["run"]:
+                show_issues(ISSUES["run"])
             do_scan()
         threading.Thread(target=work, daemon=True).start()
 
+    issues_btn.connect("clicked", lambda _: show_issues(all_issues()))
+    issues_btn.set_no_show_all(True)
     scan_btn.connect("clicked", do_scan)
     del_btn.connect("clicked", do_delete)
     win.connect("destroy", Gtk.main_quit)
@@ -332,7 +598,9 @@ def gui():
 
 if __name__ == "__main__":
     if "--list" in sys.argv:
-        for label, target, size, kind in sorted(scan(), key=lambda r: -r[2]):
-            print(f"{human(size):>9}  {kind:5} {label}")
+        for r in sorted(scan(), key=lambda r: -r.size):
+            print(f"{human(r.size):>9}  {r.kind:5} {r.label}" + (f"  [!] {r.note}" if r.note else ""))
+        for i in ISSUES["scan"]:
+            print(f"problem: {i.item}: {i.cause} -> {i.hint}")
     else:
         gui()

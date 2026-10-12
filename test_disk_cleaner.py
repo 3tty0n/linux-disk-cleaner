@@ -72,6 +72,14 @@ try:
         assert "Another package manager" in dc.issue("c", str(e)).cause
 finally:
     shutil.rmtree(fake, ignore_errors=True)
+# --- donut layout never indexes past the palette, whatever the number of rows (was an IndexError at 8 rows)
+pal = dc.PALETTE["dark"]
+for n in range(0, 25):
+    rows = [(False, f"r{k}", 1000 - k, "", "", "") for k in range(n)]
+    sl = dc.pie_slices(rows, pal)
+    assert len(sl) <= len(pal) + 1 and sum(x["size"] for x in sl) == sum(r[2] for r in rows), n
+    assert all(len(x["rows"]) == 1 for x in sl[:len(pal)]), n
+
 txt = dc.issues_text([i])
 assert "What happened" in txt and "Likely cause" in txt and "What to do" in txt
 print("all tests passed")

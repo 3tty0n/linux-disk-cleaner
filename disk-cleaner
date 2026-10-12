@@ -24,7 +24,6 @@ TERMS = {"terminator": ["-u", "-x"], "xfce4-terminal": ["--disable-server", "-x"
 PALETTE = {"light": ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6"],
            "dark": ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9"]}
 OTHER = "#8a8a85"
-SLOTS = 7
 
 Issue = collections.namedtuple("Issue", "item raw cause hint")
 Row = collections.namedtuple("Row", "label target size kind note")  # kind: rm | clear | cmd
@@ -316,6 +315,16 @@ def delete(target, kind):
         raise DeleteError(errors)
 
 
+def pie_slices(rows, pal):
+    """Top len(pal) rows by size, the rest folded into one grey 'Other' slice. rows: (sel, label, size, ...)."""
+    rows = sorted(rows, key=lambda r: -r[2])
+    top, rest = rows[:len(pal)], rows[len(pal):]
+    out = [dict(label=r[1], size=r[2], color=pal[i], rows=[r]) for i, r in enumerate(top)]
+    if rest:
+        out.append(dict(label=f"Other ({len(rest)} items)", size=sum(r[2] for r in rest), color=OTHER, rows=rest))
+    return out
+
+
 def issues_text(items):
     return "\n\n".join(f"■ {i.item}\n  What happened: {i.raw}\n  Likely cause:  {i.cause}\n  What to do:    {i.hint}"
                         for i in items)
@@ -369,14 +378,8 @@ def gui():
         return (c.red + c.green + c.blue) / 3 > 0.5
 
     def layout():
-        """Top SLOTS rows by size, rest folded into one grey 'Other' slice."""
         if "l" not in cache:
-            pal = PALETTE["dark" if is_dark() else "light"]
-            rows = sorted(store, key=lambda r: -r[2])
-            top, rest = (rows[:SLOTS], rows[SLOTS:]) if len(rows) > SLOTS + 1 else (rows, [])
-            out = [dict(label=r[1], size=r[2], color=pal[i], rows=[r]) for i, r in enumerate(top)]
-            if rest:
-                out.append(dict(label=f"Other ({len(rest)} items)", size=sum(r[2] for r in rest), color=OTHER, rows=rest))
+            out = pie_slices(list(store), PALETTE["dark" if is_dark() else "light"])
             cache["l"] = out
             cache["colors"] = {s["rows"][0][1]: s["color"] for s in out if len(s["rows"]) == 1}
         return cache["l"]
@@ -521,7 +524,9 @@ def gui():
         d.destroy()
 
     def crash(et, ev, tb):  # unexpected exceptions are shown, not printed
-        ISSUES["run"].append(Issue("internal error", "".join(traceback.format_exception_only(et, ev)),
+        where = traceback.extract_tb(tb)[-1] if tb else None
+        ISSUES["run"].append(Issue("internal error", "".join(traceback.format_exception_only(et, ev)).strip()
+                                   + (f" ({os.path.basename(where.filename)}:{where.lineno} in {where.name})" if where else ""),
                                    "A bug in disk-cleaner.", "Report it with the text above."))
         GLib.idle_add(update_issues_btn)
     sys.excepthook = crash

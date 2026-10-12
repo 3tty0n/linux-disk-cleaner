@@ -35,20 +35,21 @@ def paru_artifacts(clone):
 
 
 def scan():
-    """Yield (label, target, size, kind). kind: rm=delete path, clear=empty dir, cmd=run as root."""
+    """Yield (label, target, size, kind). kind: rm=delete paths, clear=empty dirs (keep them), cmd=run as root."""
     p = lambda *a: os.path.join(HOME, *a)
     if os.path.isdir(p(".cache")):
         for e in sorted(os.scandir(p(".cache")), key=lambda e: e.name):
             if e.name == "paru":  # keep clones (PKGBUILDs/diff history), drop only build dirs
                 continue
-            yield f"cache: {e.name}", e.path, du(e.path), "rm"
+            yield f"cache: {e.name}", e.path, du(e.path), "clear"
     for label, path in [
-        ("trash", p(".local/share/Trash")),
+        ("trash", p(".local/share/Trash/files") + "\n" + p(".local/share/Trash/info")),
         ("npm cache", p(".npm/_cacache")),
         ("cargo registry cache", p(".cargo/registry/cache")),
     ]:
-        if os.path.exists(path):
-            yield label, path, du(path), "clear" if label == "trash" else "rm"
+        paths = [x for x in path.split("\n") if os.path.isdir(x)]
+        if paths:
+            yield label, "\n".join(paths), sum(map(du, paths)), "clear"
     build = paru_artifacts(p(".cache/paru/clone"))
     if build:
         yield "paru build artifacts (untracked in clone/*)", "\n".join(build), sum(map(du, build)), "rm"
@@ -66,17 +67,17 @@ def scan():
 def delete(target, kind):
     if kind == "cmd":
         subprocess.run(["pkexec", *shlex.split(target)], check=True)
-    elif kind == "clear":
-        for e in os.scandir(target):
-            delete(e.path, "rm")
-    elif "\n" in target:  # several paths
-        for t in target.split("\n"):
-            delete(t, "rm")
-    elif os.path.isdir(target) and not os.path.islink(target):
-        subprocess.run(["chmod", "-R", "u+w", target])  # makepkg/go leave read-only dirs
-        shutil.rmtree(target)
-    else:
-        os.unlink(target)
+        return
+    for t in target.split("\n"):  # several paths
+        if kind == "clear":  # empty the dir, keep the dir itself
+            subprocess.run(["chmod", "-R", "u+w", t])  # makepkg/go leave read-only dirs
+            for e in os.scandir(t):
+                delete(e.path, "rm")
+        elif os.path.isdir(t) and not os.path.islink(t):
+            subprocess.run(["chmod", "-R", "u+w", t])
+            shutil.rmtree(t)
+        else:
+            os.unlink(t)
 
 
 def gui():
